@@ -1,0 +1,6 @@
+# Core Data Manipulation
+pandas
+numpy
+
+# Optional but highly recommended for Data Analysts
+jupyter
