@@ -1,55 +1,66 @@
 import pandas as pd
-import numpy as np
+import sqlite3
+import glob
 
-# 1. Load the Data 
-# Replace these filenames with the actual names of the CSVs you downloaded
-print("Loading datasets...")
-flights_df = pd.read_csv('bts_flights_ord_jan.csv')
-weather_df = pd.read_csv('noaa_weather_ord_jan.csv', low_memory=False)
+print("Starting SkyOps ETL Pipeline...")
 
-# 2. Clean and Prepare Flight Data
-print("Cleaning flight data...")
-# Ensure the flight date is a proper datetime object
-flights_df['FL_DATE'] = pd.to_datetime(flights_df['FL_DATE'])
+# 1. CREATE / CONNECT TO DATABASE
+# This will automatically create 'skyops.db' in your folder if it doesn't exist
+conn = sqlite3.connect('skyops.db')
 
-# BTS provides departure time as a float (e.g., 1430.0 for 2:30 PM). 
-# We extract just the hour (14) to match with NOAA's hourly weather reports.
-flights_df['DEP_HOUR'] = flights_df['DEP_TIME'].fillna(0).astype(int) // 100
+# ==========================================
+# 2. PROCESS FLIGHT DATA (EXTRACT & TRANSFORM)
+# ==========================================
+# glob finds every file that starts with 'bts_flight_' and ends with '.csv'
+flight_files = glob.glob('bts_flights_ord_*.csv') 
+print(f"\nFound {len(flight_files)} flight files to process.")
 
-# 3. Clean and Prepare Weather Data
-print("Cleaning weather data...")
-# NOAA data has a 'DATE' column containing both date and time (e.g., 2024-01-01 14:53:00)
+for file in flight_files:
+    print(f" -> Loading & Cleaning: {file}")
+    flights_df = pd.read_csv(file, low_memory=False)
+    
+    # THE FIX: Filter the dataset strictly for ORD departures
+    if 'ORIGIN' in flights_df.columns:
+        flights_df = flights_df[flights_df['ORIGIN'] == 'ORD']
+    
+    # Standardize formats (Keeping our previous Windows bug fixes!)
+    flights_df['FL_DATE'] = pd.to_datetime(flights_df['FL_DATE'], format='mixed').dt.strftime('%Y-%m-%d')
+    flights_df['DEP_HOUR'] = (flights_df['DEP_TIME'].fillna(0).astype('int64') // 100)
+    
+    # Filter columns to keep the database lightweight
+    columns_to_keep = ['FL_DATE', 'OP_UNIQUE_CARRIER', 'TAIL_NUM', 'ORIGIN', 'DEP_DELAY', 'TAXI_OUT', 'DEP_HOUR']
+    # List comprehension to prevent KeyErrors if a column is missing in a specific month
+    flights_df = flights_df[[c for c in columns_to_keep if c in flights_df.columns]]
+    
+    # LOAD: Append this month's data into the 'flights' table in SQLite
+    flights_df.to_sql('flights', conn, if_exists='append', index=False)
+
+# ==========================================
+# 3. PROCESS WEATHER DATA
+# ==========================================
+# Assuming you have one massive 12-month weather file, or you can loop it like the flights above
+print("\nProcessing Weather Data...")
+weather_df = pd.read_csv('noaa_weather_ord.csv', low_memory=False) # Update with your filename
+
+# Clean Weather
 weather_df['DATE'] = pd.to_datetime(weather_df['DATE'])
-weather_df['FL_DATE'] = weather_df['DATE'].dt.normalize() # Extracts just the YYYY-MM-DD
-weather_df['WEATHER_HOUR'] = weather_df['DATE'].dt.hour
+weather_df['FL_DATE'] = weather_df['DATE'].dt.normalize().dt.strftime('%Y-%m-%d')
+weather_df['WEATHER_HOUR'] = weather_df['DATE'].dt.hour.astype('int64')
 
-# NOAA sometimes records multiple observations per hour; keep only the first one to avoid duplicates
+# Drop duplicate hourly reports
 weather_df = weather_df.drop_duplicates(subset=['FL_DATE', 'WEATHER_HOUR'], keep='first')
 
-# 4. Merge the Datasets
-print("Joining flights and weather...")
-# We perform a left join so we don't lose any flights, matching on BOTH the day and the hour
-merged_df = pd.merge(
-    flights_df,
-    weather_df,
-    left_on=['FL_DATE', 'DEP_HOUR'],
-    right_on=['FL_DATE', 'WEATHER_HOUR'],
-    how='left'
-)
+# Handle Precipitation Imputation
+weather_df['HourlyPrecipitation'] = weather_df['HourlyPrecipitation'].replace('T', '0.01')
+weather_df['HourlyPrecipitation'] = pd.to_numeric(weather_df['HourlyPrecipitation'], errors='coerce').fillna(0)
 
-# 5. Handle Missing Values (Imputation)
-# Convert 'T' (Trace amounts of rain) to a small number, and fill missing rain data with 0
-merged_df['HourlyPrecipitation'] = merged_df['HourlyPrecipitation'].replace('T', '0.01')
-merged_df['HourlyPrecipitation'] = pd.to_numeric(merged_df['HourlyPrecipitation'], errors='coerce').fillna(0)
+# Filter columns
+weather_cols = ['FL_DATE', 'WEATHER_HOUR', 'HourlyPrecipitation', 'HourlyWindSpeed', 'HourlyVisibility']
+weather_df = weather_df[[c for c in weather_cols if c in weather_df.columns]]
 
-# 6. Select Relevant Columns for Power BI
-# We only want to export what we need for the dashboard to keep it lightweight
-columns_to_keep = [
-    'FL_DATE', 'OP_UNIQUE_CARRIER', 'TAIL_NUM', 'DEP_DELAY',
-    'TAXI_OUT', 'HourlyPrecipitation', 'HourlyWindSpeed', 'HourlyVisibility'
-]
-final_df = merged_df[columns_to_keep]
+# LOAD: Replace/Create the weather table
+weather_df.to_sql('weather', conn, if_exists='replace', index=False)
 
-# 7. Export the Clean Data
-final_df.to_csv('skyops_powerbi_ready.csv', index=False)
-print("Pipeline complete! 'skyops_powerbi_ready.csv' is ready for your dashboard.")
+# 4. CLOSE CONNECTION
+conn.close()
+print("\nPipeline Complete! Data successfully loaded into 'skyops.db'.")

@@ -1,6 +1,7 @@
 # Core Data Manipulation
 pandas
 numpy
+scikit-learn
 
 # Optional but highly recommended for Data Analysts
 jupyter
